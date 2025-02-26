@@ -1,3 +1,3 @@
-module github.com/tomnomnom/waybackurls
+module github.com/fawzixo/waybackurls
 
 go 1.18
