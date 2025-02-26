@@ -2,90 +2,121 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
+var (
+	httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	dateFormats = []string{
+		"20060102150405",         // Wayback
+		"2006-01-02 15:04:05",    // VirusTotal
+		time.RFC3339,             // Common Crawl alternative
+		"2006-01-02T15:04:05Z07:00", // Another possible format
+	}
+)
+
 func main() {
+	var (
+		dates          bool
+		noSubs         bool
+		getVersionsFlag bool
+		vtAPIKey       string
+	)
 
-	var domains []string
-
-	var dates bool
 	flag.BoolVar(&dates, "dates", false, "show date of fetch in the first column")
-
-	var noSubs bool
 	flag.BoolVar(&noSubs, "no-subs", false, "don't include subdomains of the target domain")
-
-	var getVersionsFlag bool
 	flag.BoolVar(&getVersionsFlag, "get-versions", false, "list URLs for crawled versions of input URL(s)")
-
+	flag.StringVar(&vtAPIKey, "vt-api-key", os.Getenv("VT_API_KEY"), "VirusTotal API key (defaults to VT_API_KEY environment variable)")
 	flag.Parse()
 
-	if flag.NArg() > 0 {
-		// fetch for a single domain
-		domains = []string{flag.Arg(0)}
-	} else {
-
-		// fetch for all domains from stdin
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			domains = append(domains, sc.Text())
-		}
-
-		if err := sc.Err(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
-		}
+	domains := collectDomains()
+	if len(domains) == 0 {
+		fmt.Fprintln(os.Stderr, "error: no domains specified")
+		os.Exit(1)
 	}
 
-	// get-versions mode
 	if getVersionsFlag {
-
-		for _, u := range domains {
-			versions, err := getVersions(u)
-			if err != nil {
-				continue
-			}
-			fmt.Println(strings.Join(versions, "\n"))
-		}
-
+		handleGetVersions(domains)
 		return
 	}
 
 	fetchFns := []fetchFn{
-		getWaybackURLs,
-		getCommonCrawlURLs,
-		getVirusTotalURLs,
+		makeFetchFn(getWaybackURLs),
+		makeFetchFn(getCommonCrawlURLs),
+		makeFetchFnWithAPIKey(getVirusTotalURLs, vtAPIKey),
 	}
 
-	for _, domain := range domains {
+	processDomains(domains, fetchFns, dates, noSubs)
+}
 
+func collectDomains() []string {
+	if flag.NArg() > 0 {
+		return []string{flag.Arg(0)}
+	}
+
+	var domains []string
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		domains = append(domains, strings.TrimSpace(sc.Text()))
+	}
+	if err := sc.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
+	}
+	return domains
+}
+
+func handleGetVersions(domains []string) {
+	for _, u := range domains {
+		versions, err := getVersions(u)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error getting versions for %s: %v\n", u, err)
+			continue
+		}
+		fmt.Println(strings.Join(versions, "\n"))
+	}
+}
+
+func processDomains(domains []string, fetchFns []fetchFn, dates bool, noSubs bool) {
+	for _, domain := range domains {
 		var wg sync.WaitGroup
 		wurls := make(chan wurl)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
 
 		for _, fn := range fetchFns {
 			wg.Add(1)
-			fetch := fn
-			go func() {
+			go func(f fetchFn) {
 				defer wg.Done()
-				resp, err := fetch(domain, noSubs)
-				if err != nil {
+				resp, err := f(ctx, domain, noSubs)
+				if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+					fmt.Fprintf(os.Stderr, "error fetching %s: %v\n", domain, err)
 					return
 				}
 				for _, r := range resp {
 					if noSubs && isSubdomain(r.url, domain) {
 						continue
 					}
-					wurls <- r
+					select {
+					case wurls <- r:
+					case <-ctx.Done():
+						return
+					}
 				}
-			}()
+			}(fn)
 		}
 
 		go func() {
@@ -95,26 +126,19 @@ func main() {
 
 		seen := make(map[string]bool)
 		for w := range wurls {
-			if _, ok := seen[w.url]; ok {
+			if seen[w.url] {
 				continue
 			}
 			seen[w.url] = true
 
 			if dates {
-
-				d, err := time.Parse("20060102150405", w.date)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to parse date [%s] for URL [%s]\n", w.date, w.url)
-				}
-
-				fmt.Printf("%s %s\n", d.Format(time.RFC3339), w.url)
-
+				dateStr := parseDate(w.date)
+				fmt.Printf("%s %s\n", dateStr, w.url)
 			} else {
 				fmt.Println(w.url)
 			}
 		}
 	}
-
 }
 
 type wurl struct {
@@ -122,176 +146,234 @@ type wurl struct {
 	url  string
 }
 
-type fetchFn func(string, bool) ([]wurl, error)
+type fetchFn func(context.Context, string, bool) ([]wurl, error)
 
-func getWaybackURLs(domain string, noSubs bool) ([]wurl, error) {
+func makeFetchFn(fn func(context.Context, string, bool) ([]wurl, error)) fetchFn {
+	return fn
+}
+
+func makeFetchFnWithAPIKey(fn func(context.Context, string, bool, string) ([]wurl, error), apiKey string) fetchFn {
+	return func(ctx context.Context, domain string, noSubs bool) ([]wurl, error) {
+		return fn(ctx, domain, noSubs, apiKey)
+	}
+}
+
+func getWaybackURLs(ctx context.Context, domain string, noSubs bool) ([]wurl, error) {
 	subsWildcard := "*."
 	if noSubs {
 		subsWildcard = ""
 	}
 
-	res, err := http.Get(
-		fmt.Sprintf("http://web.archive.org/cdx/search/cdx?url=%s%s/*&output=json&collapse=urlkey", subsWildcard, domain),
-	)
+	u, err := url.Parse("https://web.archive.org/cdx/search/cdx")
 	if err != nil {
-		return []wurl{}, err
+		return nil, err
 	}
 
-	raw, err := ioutil.ReadAll(res.Body)
+	q := u.Query()
+	q.Set("url", fmt.Sprintf("%s%s/*", subsWildcard, domain))
+	q.Set("output", "json")
+	q.Set("collapse", "urlkey")
+	u.RawQuery = q.Encode()
 
-	res.Body.Close()
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
-		return []wurl{}, err
+		return nil, err
+	}
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", res.StatusCode)
 	}
 
 	var wrapper [][]string
-	err = json.Unmarshal(raw, &wrapper)
+	if err := json.NewDecoder(res.Body).Decode(&wrapper); err != nil {
+		return nil, err
+	}
 
-	out := make([]wurl, 0, len(wrapper))
-
-	skip := true
-	for _, urls := range wrapper {
-		// The first item is always just the string "original",
-		// so we should skip the first item
-		if skip {
-			skip = false
+	out := make([]wurl, 0, len(wrapper)-1) // Skip header
+	for i, urls := range wrapper {
+		if i == 0 { // Skip header
+			continue
+		}
+		if len(urls) < 3 {
 			continue
 		}
 		out = append(out, wurl{date: urls[1], url: urls[2]})
 	}
 
 	return out, nil
-
 }
 
-func getCommonCrawlURLs(domain string, noSubs bool) ([]wurl, error) {
+func getCommonCrawlURLs(ctx context.Context, domain string, noSubs bool) ([]wurl, error) {
 	subsWildcard := "*."
 	if noSubs {
 		subsWildcard = ""
 	}
 
-	res, err := http.Get(
-		fmt.Sprintf("http://index.commoncrawl.org/CC-MAIN-2018-22-index?url=%s%s/*&output=json", subsWildcard, domain),
-	)
+	u, err := url.Parse("https://index.commoncrawl.org/CC-MAIN-2018-22-index")
 	if err != nil {
-		return []wurl{}, err
+		return nil, err
 	}
 
-	defer res.Body.Close()
-	sc := bufio.NewScanner(res.Body)
+	q := u.Query()
+	q.Set("url", fmt.Sprintf("%s%s/*", subsWildcard, domain))
+	q.Set("output", "json")
+	u.RawQuery = q.Encode()
 
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", res.StatusCode)
+	}
+
+	sc := bufio.NewScanner(res.Body)
 	out := make([]wurl, 0)
 
 	for sc.Scan() {
-
-		wrapper := struct {
+		var result struct {
 			URL       string `json:"url"`
 			Timestamp string `json:"timestamp"`
-		}{}
-		err = json.Unmarshal([]byte(sc.Text()), &wrapper)
-
-		if err != nil {
+		}
+		if err := json.Unmarshal(sc.Bytes(), &result); err != nil {
 			continue
 		}
-
-		out = append(out, wurl{date: wrapper.Timestamp, url: wrapper.URL})
+		out = append(out, wurl{date: result.Timestamp, url: result.URL})
 	}
 
 	return out, nil
-
 }
 
-func getVirusTotalURLs(domain string, noSubs bool) ([]wurl, error) {
+func getVirusTotalURLs(ctx context.Context, domain string, noSubs bool, apiKey string) ([]wurl, error) {
 	out := make([]wurl, 0)
-
-	apiKey := os.Getenv("VT_API_KEY")
 	if apiKey == "" {
-		// no API key isn't an error,
-		// just don't fetch
 		return out, nil
 	}
 
-	fetchURL := fmt.Sprintf(
-		"https://www.virustotal.com/vtapi/v2/domain/report?apikey=%s&domain=%s",
-		apiKey,
-		domain,
-	)
-
-	resp, err := http.Get(fetchURL)
+	u, err := url.Parse("https://www.virustotal.com/vtapi/v2/domain/report")
 	if err != nil {
 		return out, err
 	}
-	defer resp.Body.Close()
 
-	wrapper := struct {
+	q := u.Query()
+	q.Set("apikey", apiKey)
+	q.Set("domain", domain)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return out, err
+	}
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("virustotal request failed with status code: %d", res.StatusCode)
+	}
+
+	var wrapper struct {
 		URLs []struct {
-			URL string `json:"url"`
-			// TODO: handle VT date format (2018-03-26 09:22:43)
-			//Date string `json:"scan_date"`
+			URL  string `json:"url"`
+			Date string `json:"scan_date"`
 		} `json:"detected_urls"`
-	}{}
+	}
 
-	dec := json.NewDecoder(resp.Body)
-
-	err = dec.Decode(&wrapper)
+	if err := json.NewDecoder(res.Body).Decode(&wrapper); err != nil {
+		return out, err
+	}
 
 	for _, u := range wrapper.URLs {
-		out = append(out, wurl{url: u.URL})
+		out = append(out, wurl{date: u.Date, url: u.URL})
 	}
 
 	return out, nil
-
 }
 
 func isSubdomain(rawUrl, domain string) bool {
 	u, err := url.Parse(rawUrl)
 	if err != nil {
-		// we can't parse the URL so just
-		// err on the side of including it in output
 		return false
 	}
-
 	return strings.ToLower(u.Hostname()) != strings.ToLower(domain)
 }
 
 func getVersions(u string) ([]string, error) {
-	out := make([]string, 0)
-
-	resp, err := http.Get(fmt.Sprintf(
-		"http://web.archive.org/cdx/search/cdx?url=%s&output=json", u,
-	))
-
+	req, err := http.NewRequest("GET", "https://web.archive.org/cdx/search/cdx", nil)
 	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-
-	r := [][]string{}
-
-	dec := json.NewDecoder(resp.Body)
-
-	err = dec.Decode(&r)
-	if err != nil {
-		return out, err
+		return nil, err
 	}
 
-	first := true
+	q := req.URL.Query()
+	q.Add("url", u)
+	q.Add("output", "json")
+	req.URL.RawQuery = q.Encode()
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", res.StatusCode)
+	}
+
+	var results [][]string
+	if err := json.NewDecoder(res.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+
 	seen := make(map[string]bool)
-	for _, s := range r {
-
-		// skip the first element, it's the field names
-		if first {
-			first = false
+	var versions []string
+	for i, record := range results {
+		if i == 0 { // Skip header
 			continue
 		}
-
-		// fields: "urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"
-		if seen[s[5]] {
+		if len(record) < 6 {
 			continue
 		}
-		seen[s[5]] = true
-		out = append(out, fmt.Sprintf("https://web.archive.org/web/%sif_/%s", s[1], s[2]))
+		if seen[record[5]] { // Digest
+			continue
+		}
+		seen[record[5]] = true
+		versions = append(versions, 
+			fmt.Sprintf("https://web.archive.org/web/%sif_/%s", record[1], record[2]))
+	}
+	return versions, nil
+}
+
+func parseDate(dateStr string) string {
+	if dateStr == "" {
+		return ""
 	}
 
-	return out, nil
+	for _, format := range dateFormats {
+		if t, err := time.Parse(format, dateStr); err == nil {
+			return t.Format(time.RFC3339)
+		}
+	}
+
+	// Try parsing as Unix timestamp
+	if ts, err := strconv.ParseFloat(dateStr, 64); err == nil {
+		return time.Unix(int64(ts), 0).Format(time.RFC3339)
+	}
+
+	return dateStr // Return raw string if all parsing fails
 }
